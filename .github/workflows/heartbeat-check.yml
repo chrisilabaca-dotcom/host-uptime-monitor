@@ -1,0 +1,122 @@
+name: heartbeat check
+
+# Dead-man's switch for the Mac mini running FrankOps.
+#
+# The mini publishes a UTC timestamp to a public gist every 5 minutes, but ONLY
+# while Frank is genuinely alive (tmux session up + relay heartbeat fresh). If
+# that timestamp goes stale, either the machine is down or Frank is dead on it.
+# Either way Chris needs to know, and nothing running on the mini can tell him.
+#
+# Why this repo is public: public repos get unlimited free Actions minutes.
+# A private repo bills every run rounded UP to a full minute, which at this
+# cadence is ~8,640 minutes/month. No credentials live here.
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      simulate_stale:
+        description: 'Pretend the heartbeat is this many minutes old (test the alert path)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # needed to commit state.txt for alert dedupe
+
+concurrency:
+  group: heartbeat
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read heartbeat and decide
+        id: decide
+        env:
+          GIST_RAW: https://gist.githubusercontent.com/chrisilabaca-dotcom/85ed1cd12386947220b2cdd5d81d1478/raw/heartbeat.txt
+          # Heartbeat is every 5 min, but GitHub's scheduler is best-effort and
+          # routinely runs late. 20 min tolerates that without false alarms.
+          STALE_MINUTES: '20'
+          SIMULATE: ${{ github.event.inputs.simulate_stale }}
+        run: |
+          set -euo pipefail
+
+          if [ -n "$SIMULATE" ]; then
+            AGE_MIN="$SIMULATE"
+            STAMP="(simulated)"
+            echo "SIMULATION: pretending heartbeat is ${AGE_MIN}m old"
+          else
+            # Cache-buster: the raw gist host is CDN-fronted and would happily
+            # serve a stale body, which would fire a false alarm.
+            STAMP=$(curl -fsS "${GIST_RAW}?cb=$(date +%s)" | tr -d '[:space:]')
+            echo "heartbeat stamp: $STAMP"
+            HB_EPOCH=$(date -u -d "$STAMP" +%s)
+            NOW=$(date -u +%s)
+            AGE_MIN=$(( (NOW - HB_EPOCH) / 60 ))
+          fi
+
+          echo "age: ${AGE_MIN} min (threshold ${STALE_MINUTES})"
+          if [ "$AGE_MIN" -gt "$STALE_MINUTES" ]; then NEW=DOWN; else NEW=UP; fi
+
+          PREV=UP
+          [ -f state.txt ] && PREV=$(grep -m1 '^STATE=' state.txt | cut -d= -f2 || echo UP)
+
+          echo "state: $PREV -> $NEW"
+          {
+            echo "new=$NEW"
+            echo "prev=$PREV"
+            echo "age=$AGE_MIN"
+            echo "stamp=$STAMP"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Alert on state change
+        if: steps.decide.outputs.new != steps.decide.outputs.prev
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEW: ${{ steps.decide.outputs.new }}
+          AGE: ${{ steps.decide.outputs.age }}
+        run: |
+          set -euo pipefail
+          if [ "$NEW" = "DOWN" ]; then
+            MSG="🔴 MINI DOWN — no heartbeat for ${AGE} min. Frank is not running. FileVault means it will NOT self-recover: unlock the mini and log in, then the watchdog relaunches everything within ~2 min."
+          else
+            MSG="🟢 MINI RECOVERED — heartbeat is flowing again. Frank is back up."
+          fi
+          # Alert only on transitions, so a multi-hour outage sends one message,
+          # not one every 5 minutes.
+          RESP=$(curl -sS --max-time 15 -X POST \
+            "https://api.telegram.org/bot${TOKEN}/sendMessage" \
+            -d chat_id="${CHAT}" --data-urlencode "text=${MSG}")
+          echo "$RESP" | grep -q '"ok":true' || { echo "TELEGRAM SEND FAILED: $RESP"; exit 1; }
+          echo "alert delivered"
+
+      - name: Persist state
+        if: github.event.inputs.simulate_stale == ''
+        env:
+          NEW: ${{ steps.decide.outputs.new }}
+          STAMP: ${{ steps.decide.outputs.stamp }}
+        run: |
+          set -euo pipefail
+          # DAY changes daily, so this commits at least once a day even when the
+          # state is steady. That is deliberate: GitHub disables scheduled
+          # workflows in repos with no activity for 60 days, which would silently
+          # kill this monitor — the exact failure mode it exists to prevent.
+          {
+            echo "STATE=$NEW"
+            echo "LAST_HEARTBEAT=$STAMP"
+            echo "DAY=$(date -u +%Y-%m-%d)"
+          } > state.txt
+          if ! git diff --quiet state.txt 2>/dev/null || [ -z "$(git ls-files state.txt)" ]; then
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add state.txt
+            git commit -m "state: $NEW ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git push
+          else
+            echo "state unchanged, nothing to commit"
+          fi

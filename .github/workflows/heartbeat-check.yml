@@ -54,6 +54,16 @@ jobs:
             # serve a stale body, which would fire a false alarm.
             STAMP=$(curl -fsS "${GIST_RAW}?cb=$(date +%s)" | tr -d '[:space:]')
             echo "heartbeat stamp: $STAMP"
+            # reason.txt (optional, written by deadman-ping.sh when it WITHHOLDS the ping): "<stamp> <why>".
+            # If it is newer than the heartbeat, the machine is up and refusing to report healthy for that reason.
+            REASON_RAW="${GIST_RAW%/heartbeat.txt}/reason.txt"
+            REASON=$(curl -fsS "${REASON_RAW}?cb=$(date +%s)" 2>/dev/null | head -1 || true)
+            R_STAMP=$(printf '%s' "$REASON" | awk '{print $1}')
+            WHY=""
+            if [ -n "$R_STAMP" ] && [ "$(date -u -d "$R_STAMP" +%s 2>/dev/null || echo 0)" -gt "$(date -u -d "$STAMP" +%s)" ]; then
+              WHY=$(printf '%s' "$REASON" | cut -d' ' -f2- | cut -c1-300)
+            fi
+            echo "withhold reason (if newer than heartbeat): ${WHY:-none}"
             HB_EPOCH=$(date -u -d "$STAMP" +%s)
             NOW=$(date -u +%s)
             AGE_MIN=$(( (NOW - HB_EPOCH) / 60 ))
@@ -71,6 +81,7 @@ jobs:
             echo "prev=$PREV"
             echo "age=$AGE_MIN"
             echo "stamp=$STAMP"
+            echo "why=${WHY:-}"
           } >> "$GITHUB_OUTPUT"
 
       - name: Alert on state change
@@ -80,12 +91,15 @@ jobs:
           CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
           NEW: ${{ steps.decide.outputs.new }}
           AGE: ${{ steps.decide.outputs.age }}
+          WHY: ${{ steps.decide.outputs.why }}
         run: |
           set -euo pipefail
-          if [ "$NEW" = "DOWN" ]; then
-            MSG="🔴 MINI DOWN — no heartbeat for ${AGE} min. Frank is not running. FileVault means it will NOT self-recover: unlock the mini and log in, then the watchdog relaunches everything within ~2 min."
+          if [ "$NEW" = "DOWN" ] && [ -n "$WHY" ]; then
+            MSG="🟠 MINI WITHHELD its heartbeat for ${AGE} min — the Mac is UP but refusing to report healthy: ${WHY}. Check ~/automation-registry/STATUS.md on the mini."
+          elif [ "$NEW" = "DOWN" ]; then
+            MSG="🔴 MINI SILENT — no heartbeat for ${AGE} min and no reason published: the Mac is off, offline, or sitting at the FileVault login screen after a reboot (it will not self-recover from that: unlock it and log in)."
           else
-            MSG="🟢 MINI RECOVERED — heartbeat is flowing again. Frank is back up."
+            MSG="🟢 MINI RECOVERED — heartbeat is flowing again."
           fi
           # Alert only on transitions, so a multi-hour outage sends one message,
           # not one every 5 minutes.
